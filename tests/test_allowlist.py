@@ -118,12 +118,13 @@ class TestAllowlistValidation:
             "://missing-protocol",  # Malformed
             "http://",  # Incomplete
             "https://",  # Incomplete
-            "localhost:",  # Incomplete port
-            "127.0.0.1:",  # Incomplete port
+            "localhost:",  # Incomplete port (should be rejected now)
+            "127.0.0.1:",  # Incomplete port (should be rejected now)
         ]
         
         for case in edge_cases:
-            assert not domain_allowed(case), f"Should reject edge case: {case}"
+            result = domain_allowed(case)
+            assert not result, f"Should reject edge case: {case} (got {result})"
     
     def test_protocol_independence(self):
         """Test that allowlist works regardless of protocol."""
