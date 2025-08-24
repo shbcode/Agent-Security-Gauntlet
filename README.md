@@ -1,10 +1,10 @@
 # 🛡️ Agent Security Gauntlet
 
-A local, offline demonstration of defense-in-depth security patterns for LLM agents against indirect prompt injection attacks. Built with CrewAI and Streamlit.
+A local demonstration of multi-agent LLM governance for defending against indirect prompt injection attacks. Features an Adversarial Review Board (ARB) with 3 specialized LLM jurors orchestrated by CrewAI.
 
 ## What This Is
 
-The Agent Security Gauntlet is a theatrical, reliable demo that showcases how to protect LLM agents from prompt injection attacks using a multi-layered security approach. It demonstrates the **Plan → Approve → Act** workflow with real-time security monitoring and explainable defense mechanisms.
+The Agent Security Gauntlet demonstrates how to protect LLM agents from prompt injection attacks using an **Adversarial Review Board (ARB)** - a multi-agent governance system that evaluates every action before execution. The ARB uses 3 specialized LLM jurors with different security perspectives, orchestrated by CrewAI to make real-time security decisions with complete transparency.
 
 ## Why It Matters
 
@@ -20,6 +20,36 @@ This project implements security controls based on guidance from:
 - **[Microsoft Security Response Center](https://www.microsoft.com/en-us/security/blog/2024/02/22/staying-ahead-of-threat-actors-in-the-age-of-ai/)** - "Zero-trust inputs" and indirect prompt injection defenses  
 - **[NIST AI Risk Management Framework](https://www.nist.gov/itl/ai-risk-management-framework)** - Adapting conventional security controls for AI systems
 - **[AgentHarm Research](https://arxiv.org/abs/2402.18510)** - Multi-step malicious tasks and agent vulnerabilities
+
+## 🤖 Adversarial Review Board (ARB)
+
+The core innovation is a multi-agent governance system that reviews every action:
+
+### ARB Agents
+- **StaticAnalyzerAgent**: Wraps traditional heuristic scanning (regex patterns, content sanitization)
+- **RiskAnalystJurorAgent** (3 instances): Specialized LLM jurors with different security perspectives:
+  - 🔒 **Strict Security**: Zero-tolerance security expert
+  - ⚖️ **Balanced Analyst**: Risk-balanced decision maker
+  - 🎯 **Red Team Savvy**: Attack-pattern specialist
+- **PlanConformanceAgent**: Validates actions against plan contracts (domain, tool, objective alignment)
+- **ARBAggregatorAgent**: Combines all signals to make final approve/deny decisions
+
+### Key Features
+- **Real-time LLM Analysis**: 3 AI jurors analyze content with different security lenses
+- **Complete Transparency**: Every LLM interaction logged with prompts and responses
+- **Audit Trail**: Downloadable logs for compliance and analysis
+- **Generalization**: Detects novel attack patterns beyond regex rules
+- **CrewAI Orchestration**: Proper multi-agent workflow with specialized roles
+
+### Configuration
+```bash
+# Enable LLM jurors (default: on)
+export ARB_LLM=on
+export ARB_JURORS=3
+
+# Optional: Use real OpenAI API (works with mocks by default)
+export OPENAI_API_KEY=sk-...
+```
 
 ## 🚀 Quick Start
 
@@ -43,14 +73,20 @@ The application will open in your browser at `http://localhost:8501`.
 
 Perfect for judges and stakeholders:
 
-### Option A: ARB Multi-Agent Demo (Recommended)
-1. **Setup** (10s): Open app → Enable "Use Adversarial Review Board" → Select "trap_sr_only.html" 
-2. **Plan** (20s): Enter task "Find the refund policy" → Click "Run Gauntlet"
-3. **Watch** (30s): Observe ARB multi-agent workflow: Static Analyzer → Plan Conformance → Aggregator
+### ARB Multi-Agent Demo (Recommended)
+1. **Setup** (10s): Open app → Verify "LLM Enabled: Yes" → Select "trap_hidden_text.html" 
+2. **Execute** (20s): Enter task "Find the refund policy" → Click "Run Gauntlet"
+3. **Watch Console** (30s): Observe real-time LLM juror analysis:
+   ```
+   🧑‍⚖️ STRICT_SECURITY ANALYZING: TechStore - Store Policies...
+   📊 strict_security: Risk 5/5 - CRITICAL SECURITY RISK...
+   🧑‍⚖️ BALANCED_ANALYST ANALYZING: ...
+   🧑‍⚖️ RED_TEAM_SAVVY ANALYZING: ...
+   ```
 4. **Results** (30s): 
-   - Scorecard shows: Task Success ✅, Attack Blocked ✅
-   - Multiple defense layers: Static Analysis, Context Minimization, Plan Conformance
-   - Task completes via safe revision despite novel attack!
+   - Scorecard: Task Success ✅ | Attack Blocked ✅ | LLM Panel Active
+   - Juror Panel: 3 AI perspectives with detailed rationales
+   - LLM Interaction Logs: Complete transparency with downloadable audit trail
 
 ### Option B: Baseline Comparison Demo
 1. **Setup** (10s): Enable "Run baseline (no gate) in parallel" → Select "trap_hidden_text.html"

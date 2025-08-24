@@ -46,9 +46,8 @@ venv.bak/
 ehthumbs.db
 Thumbs.db
 
-# Logs (but keep the demo log for reference)
+# Logs
 *.log
-!llm_interactions.log
 
 # Temporary files
 *.tmp
@@ -66,8 +65,6 @@ htmlcov/
 .env.local
 config.local.py
 
-# Demo files that are not needed for sharing (keep the main guide)
-DEMO_CHEAT_SHEET.md
-DEMO_IMPROVEMENTS_SUMMARY.md
-DEMO_SCRIPT.md
-DEMO_VERIFICATION.md
+# Demo and documentation files (exclude from shared repo)
+DEMO_*.md
+HACKATHON_*.md
