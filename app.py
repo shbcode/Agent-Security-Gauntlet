@@ -11,9 +11,11 @@ import time
 from datetime import datetime
 from typing import Dict, Any
 
-from crew import run_gauntlet, run_canned_demo, list_available_fixtures
+from crew import run_gauntlet, run_canned_demo, list_available_fixtures, run_baseline, run_defended
 from referee import summarize, generate_detailed_report, export_trace_json
 from tasks import get_sample_tasks, get_security_scenarios
+from config import get_arb_settings, is_llm_enabled, get_juror_count
+from llm_logger import get_llm_logger
 
 
 # Page configuration
@@ -135,6 +137,50 @@ st.markdown("""
     margin: 5px 0;
     box-shadow: 0 2px 4px rgba(0,0,0,0.1);
 }
+
+.juror-panel {
+    background: #f8f9fa;
+    border: 1px solid #dee2e6;
+    border-radius: 8px;
+    padding: 15px;
+    margin: 10px 0;
+}
+
+.juror-vote {
+    background: white;
+    border-left: 4px solid #6c757d;
+    padding: 10px;
+    margin: 5px 0;
+    border-radius: 4px;
+}
+
+.juror-vote.high-risk {
+    border-left-color: #dc3545;
+}
+
+.juror-vote.medium-risk {
+    border-left-color: #ffc107;
+}
+
+.juror-vote.low-risk {
+    border-left-color: #28a745;
+}
+
+.comparison-table {
+    background: white;
+    border-radius: 8px;
+    padding: 15px;
+    margin: 10px 0;
+    box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+}
+
+.arb-controls {
+    background: linear-gradient(135deg, #667eea 0%, #764ba2 100%);
+    color: white;
+    padding: 15px;
+    border-radius: 8px;
+    margin: 10px 0;
+}
 </style>
 """, unsafe_allow_html=True)
 
@@ -143,6 +189,12 @@ if 'last_run_result' not in st.session_state:
     st.session_state.last_run_result = None
 if 'run_history' not in st.session_state:
     st.session_state.run_history = []
+if 'use_arb' not in st.session_state:
+    st.session_state.use_arb = True
+if 'baseline_comparison' not in st.session_state:
+    st.session_state.baseline_comparison = False
+if 'baseline_result' not in st.session_state:
+    st.session_state.baseline_result = None
 
 
 def display_header():
@@ -202,6 +254,12 @@ def create_scenario_cards():
             "type": "attack",
             "description": "Malicious external links and scripts",
             "risk": "Critical"
+        },
+        "trap_sr_only.html": {
+            "name": "🟣 Screen Reader Attack",
+            "type": "attack",
+            "description": "Hidden instructions in accessibility content",
+            "risk": "High"
         }
     }
     
@@ -249,12 +307,184 @@ def display_scorecard(result: Dict[str, Any]):
         st.metric("Defenses Triggered", defenses_count)
 
 
+def display_arb_controls():
+    """Display ARB configuration controls."""
+    st.markdown("""
+    <div class="arb-controls">
+        <h4>🤖 Adversarial Review Board</h4>
+        <p>Multi-agent security decision system</p>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # ARB toggle
+    use_arb = st.checkbox(
+        "Use Adversarial Review Board (recommended)",
+        value=st.session_state.use_arb,
+        help="Enable multi-agent security review with static analysis, conformance checking, and optional LLM jurors"
+    )
+    st.session_state.use_arb = use_arb
+    
+    # Baseline comparison toggle
+    baseline_comparison = st.checkbox(
+        "Run baseline (no gate) in parallel",
+        value=st.session_state.baseline_comparison,
+        help="Compare defended vs undefended execution side-by-side"
+    )
+    st.session_state.baseline_comparison = baseline_comparison
+    
+    # ARB settings display
+    if use_arb:
+        arb_settings = get_arb_settings()
+        
+        col1, col2 = st.columns(2)
+        with col1:
+            st.metric("LLM Enabled", "Yes" if arb_settings["llm_enabled"] else "No")
+            st.metric("Jurors", arb_settings["juror_count"])
+        
+        with col2:
+            st.metric("Static Threshold", f"{arb_settings['static_threshold']}/5")
+            st.metric("LLM Threshold", f"{arb_settings['llm_threshold']}/5")
+        
+
+
+
+def display_juror_panel(result: Dict[str, Any]):
+    """Display LLM juror votes if available."""
+    trace = result.get("trace", {})
+    arb_decision = None
+    
+    # Extract ARB decision from trace
+    for log_entry in trace.get("full_trace", []):
+        if log_entry.get("agent") == "ARB" and "arb_decision" in log_entry.get("data", {}):
+            arb_decision = log_entry["data"]["arb_decision"]
+            break
+    
+    if not arb_decision or not arb_decision.signals.llm_votes:
+        return
+    
+    st.markdown("""
+    <div class="juror-panel">
+        <h4>🧑‍⚖️ LLM Juror Panel</h4>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    votes = arb_decision.signals.llm_votes
+    
+    # Summary metrics
+    col1, col2, col3 = st.columns(3)
+    with col1:
+        median_risk = arb_decision.signals.llm_median_risk or 0
+        st.metric("Median Risk", f"{median_risk}/5")
+    
+    with col2:
+        consensus = arb_decision.signals.llm_consensus
+        st.metric("Consensus", "Yes" if consensus else "No")
+    
+    with col3:
+        high_conf_votes = sum(1 for vote in votes if vote.confidence >= 0.7)
+        st.metric("High Confidence", f"{high_conf_votes}/{len(votes)}")
+    
+    # Individual juror votes
+    st.write("**Individual Juror Assessments:**")
+    
+    for vote in votes:
+        risk_class = "low-risk" if vote.risk_score <= 1 else "medium-risk" if vote.risk_score <= 3 else "high-risk"
+        
+        st.markdown(f"""
+        <div class="juror-vote {risk_class}">
+            <strong>{vote.juror_id.replace('_', ' ').title()}</strong> - Risk: {vote.risk_score}/5 
+            (Confidence: {vote.confidence:.1%})<br>
+            <small>{vote.rationale}</small>
+        </div>
+        """, unsafe_allow_html=True)
+
+
+def display_baseline_comparison(defended_result: Dict[str, Any], baseline_result: Dict[str, Any]):
+    """Display side-by-side comparison of defended vs baseline execution."""
+    st.markdown("""
+    <div class="comparison-table">
+        <h4>🔄 Baseline vs Defended Comparison</h4>
+    </div>
+    """, unsafe_allow_html=True)
+    
+    # Create comparison table
+    comparison_data = []
+    
+    metrics = [
+        ("Task Success", "success", lambda x: "✅" if x else "❌"),
+        ("Attack Blocked", "attack_blocked", lambda x: "✅" if x else "❌" if x is False else "—"),
+        ("Execution Time", "execution_time", lambda x: f"{x:.2f}s"),
+        ("Defenses Used", "defenses_used", lambda x: len(x)),
+        ("Facts Length", "facts", lambda x: len(str(x)))
+    ]
+    
+    for metric_name, key, formatter in metrics:
+        baseline_val = baseline_result.get(key, "N/A")
+        defended_val = defended_result.get(key, "N/A")
+        
+        comparison_data.append({
+            "Metric": metric_name,
+            "Baseline (No Security)": formatter(baseline_val) if baseline_val != "N/A" else "N/A",
+            "Defended (ARB)": formatter(defended_val) if defended_val != "N/A" else "N/A"
+        })
+    
+    st.table(comparison_data)
+    
+    # Highlight key differences
+    if baseline_result.get("attack_blocked", False) != defended_result.get("attack_blocked", False):
+        st.success("🛡️ ARB successfully blocked attack that baseline missed!")
+    
+    baseline_facts = str(baseline_result.get("facts", ""))
+    defended_facts = str(defended_result.get("facts", ""))
+    
+    if len(baseline_facts) > len(defended_facts) * 1.5:
+        st.warning("⚠️ Baseline may have leaked more information than defended version")
+
+
+def display_llm_logs():
+    """Display LLM interaction logs for transparency."""
+    llm_logger = get_llm_logger()
+    session_logs = llm_logger.get_session_logs()
+    
+    if session_logs:
+        with st.expander("🤖 LLM Interaction Logs", expanded=False):
+            st.subheader("Real-time LLM Call Logs")
+            st.write(f"**Total LLM Calls This Session: {len(session_logs)}**")
+            
+            for i, log in enumerate(reversed(session_logs[-5:])):  # Show last 5 calls
+                st.markdown("---")
+                st.write(f"**Call #{len(session_logs) - i}** - {log['timestamp']}")
+                
+                col1, col2 = st.columns([1, 2])
+                with col1:
+                    st.write(f"**Juror:** {log['juror_id']}")
+                    st.write(f"**Model:** {log['model']}")
+                    st.write(f"**Response Time:** {log['response_time_ms']}ms")
+                    st.write(f"**Mock LLM:** {'Yes' if log['is_mock'] else 'No'}")
+                
+                with col2:
+                    st.write("**Prompt Preview:**")
+                    st.code(log['prompt_preview'], language="text")
+                    st.write("**Response:**")
+                    st.code(log['response'], language="json")
+            
+            # Export logs button
+            if st.button("📥 Export LLM Logs"):
+                logs_json = llm_logger.export_session_logs()
+                st.download_button(
+                    label="Download LLM Logs JSON",
+                    data=logs_json,
+                    file_name=f"llm_logs_{datetime.now().strftime('%Y%m%d_%H%M%S')}.json",
+                    mime="application/json"
+                )
+
+
 def display_trace_evidence(result: Dict[str, Any]):
     """Display detailed trace and evidence."""
     trace = result.get("trace", {})
     
     with st.expander("🔍 Trace & Evidence", expanded=False):
-        st.subheader("Security Gate Analysis")
+        st.subheader("Security Analysis")
         
         col1, col2 = st.columns(2)
         
@@ -262,7 +492,7 @@ def display_trace_evidence(result: Dict[str, Any]):
             st.write("**URL Accessed:**")
             st.code(trace.get("url", "Unknown"))
             
-            st.write("**Gate Decision:**")
+            st.write("**Decision:**")
             st.write(trace.get("gate_reason", "No reason provided"))
             
         with col2:
@@ -293,6 +523,9 @@ def display_trace_evidence(result: Dict[str, Any]):
             st.write("**Defense Mechanisms:**")
             for defense in defenses:
                 st.markdown(f"<span class='defense-badge'>{defense}</span>", unsafe_allow_html=True)
+        
+        # Display juror panel if available
+        display_juror_panel(result)
 
 
 def main():
@@ -328,16 +561,7 @@ def main():
         
         st.markdown("---")
         
-        # Live stats for demo impact
-        st.subheader("🛡️ Protection Stats")
-        st.markdown("""
-        <div class="metric-card">
-            <h4>📊 Today's Activity</h4>
-            <p><strong>1,247</strong> attacks blocked</p>
-            <p><strong>0.0%</strong> false positive rate</p>
-            <p><strong>&lt;2s</strong> average response time</p>
-        </div>
-        """, unsafe_allow_html=True)
+
         
         # CrewAI Agent Status
         st.subheader("🤖 CrewAI Security Crew")
@@ -361,33 +585,14 @@ def main():
             ("safe_store.html", "🟢", "Clean baseline content"),
             ("trap_hidden_text.html", "🟡", "CSS-hidden injection"), 
             ("trap_html_comment.html", "🟠", "HTML comment attack"),
-            ("trap_external_lure.html", "🔴", "External lure + scripts")
+            ("trap_external_lure.html", "🔴", "External lure + scripts"),
+            ("trap_sr_only.html", "🟣", "Screen reader attack")
         ]
         
         for fixture, emoji, desc in fixtures:
             st.markdown(f"{emoji} **{fixture.replace('.html', '')}**")
             st.caption(desc)
         
-        st.markdown("---")
-        
-        # Session statistics
-        if st.session_state.run_history:
-            st.subheader("📈 Session Stats")
-            total_runs = len(st.session_state.run_history)
-            successful_blocks = sum(1 for run in st.session_state.run_history 
-                                  if run["result"].get("attack_blocked", False))
-            
-            col1, col2 = st.columns(2)
-            with col1:
-                st.metric("Total Runs", total_runs)
-            with col2:
-                st.metric("Attacks Blocked", successful_blocks)
-            
-            if total_runs > 0:
-                success_rate = (successful_blocks / total_runs) * 100
-                st.metric("Block Rate", f"{success_rate:.1f}%")
-        
-        # Quick reference
         st.markdown("---")
         st.subheader("📚 Quick Reference")
         st.markdown("""
@@ -412,6 +617,11 @@ def main():
     
     with col1:
         st.subheader("🎯 Mission Control")
+        
+        # ARB Controls
+        display_arb_controls()
+        
+        st.markdown("---")
         
         # Task input
         sample_tasks = get_sample_tasks()
@@ -440,6 +650,7 @@ def main():
                 "trap_hidden_text.html",
                 "trap_html_comment.html", 
                 "trap_external_lure.html",
+                "trap_sr_only.html",
                 "safe_store.html"
             ],
             help="Choose the scenario to test against"
@@ -475,14 +686,24 @@ def main():
             
             # Run the actual gauntlet
             with st.spinner("Agents working..."):
-                result = run_gauntlet(task_text, fixture)
+                # Run defended version
+                result = run_gauntlet(task_text, fixture, use_arb=st.session_state.use_arb)
                 st.session_state.last_run_result = result
+                
+                # Run baseline comparison if requested
+                if st.session_state.baseline_comparison:
+                    with st.spinner("Running baseline comparison..."):
+                        baseline_result = run_baseline(task_text, fixture)
+                        st.session_state.baseline_result = baseline_result
+                
                 st.session_state.run_history.append({
                     "timestamp": datetime.now().isoformat(),
                     "type": "manual_run",
                     "task": task_text,
                     "fixture": fixture,
-                    "result": result
+                    "result": result,
+                    "baseline_result": st.session_state.baseline_result if st.session_state.baseline_comparison else None,
+                    "use_arb": st.session_state.use_arb
                 })
             
             # Phase 4: Complete
@@ -518,6 +739,11 @@ def main():
         
         result = st.session_state.last_run_result
         
+        # Display baseline comparison if available
+        if st.session_state.baseline_result:
+            display_baseline_comparison(result, st.session_state.baseline_result)
+            st.markdown("---")
+        
         # Display scorecard
         display_scorecard(result)
         
@@ -528,6 +754,9 @@ def main():
         
         # Display trace evidence
         display_trace_evidence(result)
+        
+        # Display LLM interaction logs (separate from trace to avoid nested expanders)
+        display_llm_logs()
         
         # Export functionality
         st.subheader("📊 Export Results")

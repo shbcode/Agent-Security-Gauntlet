@@ -3,6 +3,8 @@ CrewAI orchestration for the Agent Security Gauntlet.
 
 Implements a multi-agent system with plan → approve → act workflow
 demonstrating defense-in-depth against prompt injection attacks.
+
+Now enhanced with the Adversarial Review Board (ARB) for multi-agent security decisions.
 """
 
 import random
@@ -14,6 +16,10 @@ from crewai import Agent, Task, Crew
 from tools.browser import fetch_local, extract_text, fetch_and_extract
 from safety_gate import gate
 from tasks import get_task_by_id
+from arb import run_arb
+from arb_models import PlanContract
+from config import get_arb_settings
+from memory import get_risk_ledger
 
 
 def _url_for_fixture(fixture_name: str) -> str:
@@ -75,13 +81,23 @@ referee_agent = Agent(
 class GauntletOrchestrator:
     """
     Orchestrates the security gauntlet workflow with explicit plan → approve → act phases.
+    
+    Now enhanced with the Adversarial Review Board (ARB) for multi-agent security decisions.
     """
     
-    def __init__(self, seed: int = None):
-        """Initialize with optional random seed for deterministic behavior."""
+    def __init__(self, seed: int = None, use_arb: bool = True):
+        """
+        Initialize with optional random seed for deterministic behavior.
+        
+        Args:
+            seed: Random seed for deterministic behavior
+            use_arb: Whether to use the Adversarial Review Board (True) or legacy safety gate (False)
+        """
         if seed is not None:
             random.seed(seed)
         self.trace_log = []
+        self.use_arb = use_arb
+        self.risk_ledger = get_risk_ledger()
         
     def log_step(self, step: str, agent: str, data: Dict[str, Any]) -> None:
         """Log a step in the execution trace."""
@@ -116,19 +132,34 @@ class GauntletOrchestrator:
             plan = self._create_execution_plan(task_text, url)
             self.log_step("planning", "BluePlanner", {"plan": plan, "task": task_text})
             
-            # Phase 3: Safety gate evaluates the plan
-            safety_result = self._evaluate_plan_safety(url)
-            self.log_step("safety_evaluation", "SafetyGate", safety_result)
+            # Phase 3: Safety gate/ARB evaluates the plan
+            safety_result = self._evaluate_plan_safety(url, task_text, fixture_name)
+            evaluation_agent = "ARB" if self.use_arb else "SafetyGate"
+            self.log_step("safety_evaluation", evaluation_agent, safety_result)
             
             # Phase 4: Execute based on safety gate decision
             if safety_result["approved"]:
                 execution_result = self._execute_approved_plan(url, task_text)
                 self.log_step("execution", "BlueExecutor", execution_result)
             else:
-                # Replan with safe fallback
-                fallback_result = self._execute_fallback_plan(task_text)
-                self.log_step("fallback_execution", "BlueExecutor", fallback_result)
-                execution_result = fallback_result
+                # Check if we should trigger escalation fallback
+                if self.use_arb and self.risk_ledger.should_trigger_fallback():
+                    fallback_result = self._execute_fallback_plan(task_text)
+                    fallback_result["escalation_fallback"] = True
+                    self.log_step("escalation_fallback", "BlueExecutor", fallback_result)
+                    execution_result = fallback_result
+                else:
+                    # Try revised plan if ARB suggested one
+                    arb_decision = safety_result.get("arb_decision")
+                    if arb_decision and arb_decision.revised_step:
+                        revised_result = self._execute_revised_plan(arb_decision.revised_step, task_text)
+                        self.log_step("revised_execution", "BlueExecutor", revised_result)
+                        execution_result = revised_result
+                    else:
+                        # Standard fallback
+                        fallback_result = self._execute_fallback_plan(task_text)
+                        self.log_step("fallback_execution", "BlueExecutor", fallback_result)
+                        execution_result = fallback_result
             
             # Phase 5: Referee evaluation
             final_result = self._compile_final_results(
@@ -157,44 +188,54 @@ class GauntletOrchestrator:
         plan = {
             "task": task_text,
             "steps": [
-                {"id": 1, "action": "fetch_url", "target": url, "description": "Fetch web content"},
-                {"id": 2, "action": "extract_facts", "description": "Extract relevant information"},
+                {"id": 1, "action": "read_page", "target": url, "tool": "read_page", "description": "Fetch web content"},
+                {"id": 2, "action": "extract_facts", "tool": "extract_text", "description": "Extract relevant information"},
                 {"id": 3, "action": "format_response", "description": "Format final answer"}
             ],
             "expected_outcome": "Facts extracted safely from approved content",
-            "security_requirements": ["domain_allowlist", "content_sanitization"]
+            "security_requirements": ["domain_allowlist", "content_sanitization", "plan_conformance"]
         }
         return plan
     
-    def _evaluate_plan_safety(self, url: str) -> Dict[str, Any]:
-        """Evaluate the safety of accessing the planned URL."""
+    def _build_plan_contract(self, task_text: str, fixture_name: str) -> PlanContract:
+        """Build a plan contract for ARB evaluation."""
+        # Extract objective tags from task text
+        task_lower = task_text.lower()
+        objective_tags = []
+        
+        if "refund" in task_lower or "return" in task_lower:
+            objective_tags.extend(["refund", "return"])
+        if "warranty" in task_lower:
+            objective_tags.append("warranty")
+        if "policy" in task_lower or "policies" in task_lower:
+            objective_tags.append("policy")
+        if "hours" in task_lower or "time" in task_lower:
+            objective_tags.append("hours")
+        if "contact" in task_lower:
+            objective_tags.append("contact")
+        
+        # Default objectives if none found
+        if not objective_tags:
+            objective_tags = ["policy", "information"]
+        
+        return PlanContract(
+            domain="localhost",
+            tool="read_page",
+            objective_tags=objective_tags
+        )
+    
+    def _evaluate_plan_safety(self, url: str, task_text: str = "", fixture_name: str = "") -> Dict[str, Any]:
+        """Evaluate the safety of accessing the planned URL using ARB or legacy safety gate."""
         try:
             # Fetch content for evaluation
             html_content = fetch_local(url)
             
-            # Run through safety gate
-            approved, reason, meta = gate(url, html_content)
-            
-            # Determine defenses used
-            defenses = []
-            if not meta.get("allowlist_ok", True):
-                defenses.append("Allowlist Block")
-            if meta.get("score", 0) >= 2:
-                defenses.append("Suspicious Pattern")
-                defenses.append("Context Minimization")
-            if meta.get("patterns", []):
-                if not any("Suspicious Pattern" in d for d in defenses):
-                    defenses.append("Pattern Detection")
-            if not approved:
-                defenses.append("Human Approval Required")
-            
-            return {
-                "approved": approved,
-                "reason": reason,
-                "gate_meta": meta,
-                "defenses_triggered": defenses,
-                "url": url
-            }
+            if self.use_arb:
+                # Use Adversarial Review Board
+                return self._evaluate_with_arb(url, html_content, task_text, fixture_name)
+            else:
+                # Use legacy safety gate
+                return self._evaluate_with_legacy_gate(url, html_content)
             
         except Exception as e:
             # Check if it's a missing fixture error
@@ -206,8 +247,70 @@ class GauntletOrchestrator:
                 "reason": f"Safety evaluation failed: {e}",
                 "gate_meta": {"score": 5, "patterns": [], "snippet": "", "allowlist_ok": False},
                 "defenses_triggered": ["Error Handler"],
-                "url": url
+                "url": url,
+                "arb_decision": None
             }
+    
+    def _evaluate_with_arb(self, url: str, html_content: str, task_text: str, fixture_name: str) -> Dict[str, Any]:
+        """Evaluate using the Adversarial Review Board."""
+        # Build plan contract
+        contract = self._build_plan_contract(task_text, fixture_name)
+        
+        # Create step for ARB evaluation
+        step = {
+            "action": "read_page",
+            "url": url,
+            "tool": "read_page",
+            "fixture": fixture_name
+        }
+        
+        # Get ARB settings
+        settings = get_arb_settings()
+        
+        # Run ARB analysis
+        arb_decision = run_arb(step, url, html_content, contract, settings)
+        
+        # Convert ARB decision to legacy format for compatibility
+        return {
+            "approved": arb_decision.approved,
+            "reason": "; ".join(arb_decision.reasons) if arb_decision.reasons else "ARB decision",
+            "gate_meta": {
+                "score": arb_decision.signals.static_score,
+                "patterns": arb_decision.signals.static_patterns,
+                "snippet": arb_decision.sanitized_text[:200],
+                "allowlist_ok": arb_decision.signals.allowlist_ok
+            },
+            "defenses_triggered": arb_decision.defenses_used,
+            "url": url,
+            "arb_decision": arb_decision  # Include full ARB decision
+        }
+    
+    def _evaluate_with_legacy_gate(self, url: str, html_content: str) -> Dict[str, Any]:
+        """Evaluate using the legacy safety gate."""
+        # Run through safety gate
+        approved, reason, meta = gate(url, html_content)
+        
+        # Determine defenses used
+        defenses = []
+        if not meta.get("allowlist_ok", True):
+            defenses.append("Allowlist Block")
+        if meta.get("score", 0) >= 2:
+            defenses.append("Suspicious Pattern")
+            defenses.append("Context Minimization")
+        if meta.get("patterns", []):
+            if not any("Suspicious Pattern" in d for d in defenses):
+                defenses.append("Pattern Detection")
+        if not approved:
+            defenses.append("Human Approval Required")
+        
+        return {
+            "approved": approved,
+            "reason": reason,
+            "gate_meta": meta,
+            "defenses_triggered": defenses,
+            "url": url,
+            "arb_decision": None  # No ARB decision in legacy mode
+        }
     
     def _execute_approved_plan(self, url: str, task_text: str) -> Dict[str, Any]:
         """Execute the plan with approved content."""
@@ -256,6 +359,39 @@ class GauntletOrchestrator:
                 "error": str(e),
                 "method": "fallback_execution"
             }
+    
+    def _execute_revised_plan(self, revised_step: Dict[str, Any], task_text: str) -> Dict[str, Any]:
+        """Execute a revised plan suggested by the ARB."""
+        try:
+            # Use the revised step's URL or fallback to safe content
+            target_url = revised_step.get("url", _url_for_fixture("safe_store.html"))
+            
+            # Apply restrictions from the revised step
+            restrictions = revised_step.get("restrictions", [])
+            
+            # Fetch content with restrictions applied
+            if "visible_text_only" in restrictions:
+                # Use sanitized content extraction
+                content = fetch_and_extract(target_url)
+            else:
+                content = fetch_and_extract(target_url)
+            
+            # Apply additional content filtering based on restrictions
+            if "facts_only" in restrictions:
+                content = self._extract_task_relevant_facts(content, task_text)
+            
+            return {
+                "success": True,
+                "content_accessed": target_url,
+                "facts_extracted": content[:400],  # Limit output
+                "method": "revised_execution",
+                "restrictions_applied": restrictions,
+                "note": "Executed revised plan with safety restrictions"
+            }
+            
+        except Exception as e:
+            # If revised plan fails, fallback to safe content
+            return self._execute_fallback_plan(task_text)
     
     def _extract_task_relevant_facts(self, content: str, task_text: str) -> str:
         """Extract facts relevant to the task from safe content."""
@@ -339,19 +475,62 @@ class GauntletOrchestrator:
         }
 
 
-def run_gauntlet(task_text: str, fixture_name: str) -> Dict[str, Any]:
+def run_gauntlet(task_text: str, fixture_name: str, use_arb: bool = True) -> Dict[str, Any]:
     """
     Main entry point for running the security gauntlet.
     
     Args:
         task_text: User task to complete
         fixture_name: HTML fixture to use (e.g., "safe_store.html")
+        use_arb: Whether to use ARB (True) or legacy safety gate (False)
         
     Returns:
         Complete execution results with security analysis
     """
-    orchestrator = GauntletOrchestrator(seed=42)  # Deterministic for demos
+    orchestrator = GauntletOrchestrator(seed=42, use_arb=use_arb)  # Deterministic for demos
     return orchestrator.run_gauntlet(task_text, fixture_name)
+
+
+def run_baseline(task_text: str, fixture_name: str) -> Dict[str, Any]:
+    """
+    Run the gauntlet with no security gate (baseline for comparison).
+    
+    Args:
+        task_text: User task to complete
+        fixture_name: HTML fixture to use
+        
+    Returns:
+        Execution results without security controls
+    """
+    # Create a special orchestrator that bypasses all security
+    class BaselineOrchestrator(GauntletOrchestrator):
+        def _evaluate_plan_safety(self, url: str, task_text: str = "", fixture_name: str = "") -> Dict[str, Any]:
+            """Always approve for baseline comparison."""
+            return {
+                "approved": True,
+                "reason": "Baseline mode - no security checks",
+                "gate_meta": {"score": 0, "patterns": [], "snippet": "", "allowlist_ok": True},
+                "defenses_triggered": ["None (Baseline)"],
+                "url": url,
+                "arb_decision": None
+            }
+    
+    orchestrator = BaselineOrchestrator(seed=42, use_arb=False)
+    return orchestrator.run_gauntlet(task_text, fixture_name)
+
+
+def run_defended(task_text: str, fixture_name: str) -> Dict[str, Any]:
+    """
+    Run the gauntlet with ARB protection (for side-by-side comparison).
+    
+    Args:
+        task_text: User task to complete
+        fixture_name: HTML fixture to use
+        
+    Returns:
+        Execution results with full ARB protection
+    """
+    return run_gauntlet(task_text, fixture_name, use_arb=True)
 
 
 def run_canned_demo() -> Dict[str, Any]:
